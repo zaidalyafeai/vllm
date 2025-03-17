@@ -13,7 +13,7 @@ import torch
 import uvloop
 from benchmark_dataset import (BurstGPTDataset, HuggingFaceDataset,
                                RandomDataset, SampleRequest, ShareGPTDataset,
-                               SonnetDataset, VisionArenaDataset)
+                               SimplePromptsDataset, VisionArenaDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
@@ -41,8 +41,11 @@ def run_vllm(
         llm.llm_engine.model_config.max_model_len >= (
             request.prompt_len + request.expected_output_len)
         for request in requests), (
-            "Please ensure that max_model_len is greater than the sum of"
-            " prompt_len and expected_output_len for all requests.")
+            "Please ensure that max_model_len: {} is greater than the sum of"
+            " prompt_len: {} and expected_output_len: {} for all requests."
+            .format(llm.llm_engine.model_config.max_model_len,
+                    request.prompt_len,
+                    request.expected_output_len))
     # Add the requests to the engine.
     prompts: list[Union[TextPrompt, TokensPrompt]] = []
     sampling_params: list[SamplingParams] = []
@@ -76,6 +79,11 @@ def run_vllm(
                                lora_request=lora_requests,
                                use_tqdm=True)
         end = time.perf_counter()
+
+        # save the outputs to a file
+        with open(args.output, 'w') as f:
+            for output in outputs:
+                json.dump({"prompt": output.prompt, "output": output.outputs[0].text}, f, indent=4)
     else:
         assert lora_requests is None, "BeamSearch API does not support LoRA"
         prompts = [request.prompt for request in requests]
@@ -314,12 +322,14 @@ def get_requests(args, tokenizer):
         dataset_cls = SonnetDataset
         sample_kwargs["prefix_len"] = args.prefix_len
         sample_kwargs["return_prompt_formatted"] = True
+    elif args.dataset_name == "simple_prompts":
+        dataset_cls = SimplePromptsDataset
     elif args.dataset_name == "burstgpt":
         dataset_cls = BurstGPTDataset
     elif args.dataset_name == "hf":
-        if args.backend != "vllm-chat":
-            raise ValueError(
-                "hf datasets only are supported by vllm-chat backend")
+        # if args.backend != "vllm-chat":
+        #     raise ValueError(
+        #         "hf datasets only are supported by vllm-chat backend")
         # Choose between VisionArenaDataset and HuggingFaceDataset based on
         # provided parameters.
         dataset_cls = (VisionArenaDataset if args.dataset_path
@@ -462,9 +472,9 @@ def validate_args(args):
         warnings.warn("--hf-subset and --hf-split will be ignored \
                 since --dataset-name is not 'hf'.",
                       stacklevel=2)
-    elif args.dataset_name == "hf" and args.backend != "vllm-chat":
-        raise ValueError(
-            "When --dataset-name is 'hf', backend must be 'vllm-chat'")
+    # elif args.dataset_name == "hf" and args.backend != "vllm-chat":
+    #     raise ValueError(
+    #         "When --dataset-name is 'hf', backend must be 'vllm-chat'")
 
     # --random-range-ratio: only used when dataset_name is 'random'
     if args.dataset_name != 'random' and args.random_range_ratio is not None:
@@ -515,7 +525,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-name",
         type=str,
-        choices=["sharegpt", "random", "sonnet", "burstgpt", "hf"],
+        choices=["sharegpt", "random", "sonnet", "burstgpt", "hf", "simple_prompts"],
         help="Name of the dataset to benchmark on.",
         default="sharegpt")
     parser.add_argument(
@@ -599,6 +609,11 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="Split of the HF dataset.")
+
+    parser.add_argument("--output",
+                        type=str,
+                        default=None,
+                        help="Path to save the outputs.")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
