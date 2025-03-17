@@ -390,6 +390,56 @@ class ShareGPTDataset(BenchmarkDataset):
 # Sonnet Dataset Implementation
 # -----------------------------------------------------------------------------
 
+class SimplePromptsDataset(BenchmarkDataset):
+    """
+    Simplified implementation of the Sonnet dataset.  Loads poem lines from a
+    text file and generates sample requests.  Default values here copied from
+    `benchmark_serving.py` for the sonnet dataset.
+    """
+
+    DEFAULT_PREFIX_LEN = 200
+    DEFAULT_INPUT_LEN = 550
+    DEFAULT_OUTPUT_LEN = 150
+
+    def __init__(
+        self,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if not self.dataset_path:
+            raise ValueError("dataset_path must be provided.")
+
+        with open(self.dataset_path, encoding="utf-8") as f:
+            self.data = f.readlines()
+
+    def sample(self,
+               tokenizer,
+               num_requests: int,
+               prefix_len: int = DEFAULT_PREFIX_LEN,
+               input_len: int = DEFAULT_INPUT_LEN,
+               output_len: int = DEFAULT_OUTPUT_LEN,
+               return_prompt_formatted: bool = False,
+               **kwargs) -> list:
+        # Calculate average token length for a poem line.
+
+        samples = []
+        for _ in range(num_requests):
+            prompt = random.choice(self.data)
+            msg = [{"role": "user", "content": prompt}]
+            prompt_formatted = tokenizer.apply_chat_template(
+                msg, add_generation_prompt=True, tokenize=False)
+            prompt_len = len(tokenizer(prompt_formatted).input_ids)
+            samples.append(
+                SampleRequest(
+                    prompt=prompt_formatted
+                    if return_prompt_formatted else prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                ))
+        return samples
 
 class SonnetDataset(BenchmarkDataset):
     """
@@ -545,16 +595,18 @@ class HuggingFaceDataset(BenchmarkDataset):
     and optional images.
     """
     DEFAULT_NUM_REQUESTS = 1000
-
+    DEFAULT_OUTPUT_LEN = 128
     def __init__(
         self,
         dataset_split: str,
         dataset_subset: Optional[str] = None,
+        max_len: Optional[int] = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.dataset_split = dataset_split
         self.dataset_subset = dataset_subset
+        self.max_len = max_len
 
         self.load_data()
 
@@ -568,55 +620,34 @@ class HuggingFaceDataset(BenchmarkDataset):
             split=self.dataset_split,
             streaming=True,
         )
-        if self.data.features is None or "conversations" \
-            not in self.data.features:
-            raise ValueError(
-                "HuggingFaceDataset currently only supports datasets with "
-                "a 'conversations' column like lmms-lab/LLaVA-OneVision-Data. "
-                "Please consider contributing if you would like to add "
-                "support for additional dataset formats.")
         # Shuffle and filter examples with at least 2 conversations.
-        self.data = self.data.shuffle(seed=self.random_seed).filter(
-            lambda x: len(x["conversations"]) >= 2)
+        self.data = self.data.shuffle(seed=self.random_seed)
 
     def sample(self,
                tokenizer: PreTrainedTokenizerBase,
                num_requests: int,
-               output_len: Optional[int] = None,
+               output_len: int = DEFAULT_OUTPUT_LEN,
                enable_multimodal_chat: bool = False,
                **kwargs) -> list:
         sampled_requests = []
-        dynamic_output = output_len is None
 
         for item in self.data:
             if len(sampled_requests) >= num_requests:
                 break
-            conv = item["conversations"]
-            prompt, completion = conv[0]["value"], conv[1]["value"]
+            prompt = f"""
+            You are given the following text, please rephrase it into Arabic:
+            {item["text"]}
+            """
+            msg = [{"role": "user", "content": prompt}]
+            prompt_formatted = tokenizer.apply_chat_template(
+                msg, add_generation_prompt=True, tokenize=False)
+            prompt_len = len(tokenizer(prompt_formatted).input_ids)
 
-            prompt_ids = tokenizer(prompt).input_ids
-            completion_ids = tokenizer(completion).input_ids
-            prompt_len = len(prompt_ids)
-            completion_len = len(completion_ids)
-            output_len = completion_len if dynamic_output else output_len
-            assert isinstance(output_len, int) and output_len > 0
-            if dynamic_output and not is_valid_sequence(
-                    prompt_len, completion_len):
-                continue
-            mm_content = process_image(
-                item["image"]) if "image" in item else None
-            if enable_multimodal_chat:
-                # Note: when chat is enabled the request prompt_len is no longer
-                # accurate and we will be using request output to count the
-                # actual prompt len and output len
-                prompt = self.apply_multimodal_chat_transformation(
-                    prompt, mm_content)
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
-                    multi_modal_data=mm_content,
                 ))
         return sampled_requests
 
